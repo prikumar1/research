@@ -1,0 +1,1068 @@
+---
+title: "Script"
+output:
+  pdf_document: default
+  html_document: default
+date: '01/07/2022'
+---
+
+# Which methods produce more interpretable phenomena: FastText in combination with Hierarchical clustering or Spherical K-means clustering?
+
+*NOTE: Run the chunks one by one (some chunks take a lot of time to run)*
+
+
+## Load packages:
+
+```{r}
+library(bib2df)
+library(cluster)
+library(data.table, quietly = TRUE, warn.conflicts = FALSE)
+library(dplyr)
+library(dynamicTreeCut)
+library(factoextra)
+library(ggplot2)
+library(plotly)
+library(proxy)
+library(Rtsne)
+library(R.utils)
+library(skmeans)
+library(stringr)
+library(text2vec)
+library(textrank)
+library(tibble)
+library(tidytext)
+library(udpipe)
+library(widyr)
+
+# for reproducibility
+set.seed(123)
+```
+
+
+## Load datasets: 
+
+```{r}
+# Articles on teenagers' emotional problems from Van Lissa (2021)
+emotion_articles <- data.table(read.csv("recs_final.csv"))
+# -> [6305 rows x 74 columns]
+
+# Articles on cooperation in prisoner's dilemma's from the Cooperation Databank
+cooperation_articles <- bib2df::bib2df("paper_included_with_abstract.bib")
+# -> [2004 rows x 106 columns]
+
+# Check duplicate articles (on title and doi)
+emotion_articles$title[duplicated(emotion_articles$title)] #no duplicate articles
+emotion_articles$doi[duplicated(emotion_articles$doi)] #no duplicate articles
+cooperation_articles$TITLE[duplicated(cooperation_articles$TITLE)] #no duplicate
+cooperation_articles$DOI[duplicated(cooperation_articles$DOI)] # a lot of NA but no duplicate articles
+
+# Remove duplicate articles
+# Use following code but replace data and column names
+# data <- data[!duplicated(data$column), ] 
+```
+
+
+
+## Data preprocessing - clean and prepare text data:
+
+```{r}
+# Preprocessing function that requires as input the column with text data to clean and prepare
+
+preprocessing <- function(column){
+
+  # Remove missing values that might be present in the column
+  key_articles <- na.omit(column)
+  
+  # Convert text to lowercase
+  lower <- tolower(key_articles)
+
+  # Word tokenization, POS-tagging and lemmatization using UDPipe (R package)  
+  # If the english model is not in directory
+  if(!file.exists(".../research/english-ewt-ud-2.5-191206.udpipe")){
+    # Download English UDPipe model 
+    udpipe_model <- udpipe_download_model(language = "english")
+    } else {
+      # Load the language model from directory
+      udpipe_model <- udpipe_load_model(".../research/english-ewt-ud-2.5-191206.udpipe")
+    }
+  # Load the English UDPipe model
+  ud_english <- udpipe_load_model(udpipe_model$file)
+  
+  # Apply the English UDPipe model on lowercased text
+  tokens <- udpipe_annotate(ud_english, x = lower, 
+                            tagger = "default", 
+                            parser = "none")
+  
+  # Convert to data table 
+  df_udpipe <- as.data.table(tokens)
+
+  # Extract words: nouns and adjectives
+  words <- df_udpipe[df_udpipe$upos %in% c("NOUN", "ADJ"),]
+  
+  # Extract lemma that start with a letter
+  lemma_words <- words[grepl("^[a-zA-Z].", words$lemma),]
+  
+  # Create new data table with only doc_id and lemma 
+  df_tokens <- select(lemma_words, doc_id, lemma)
+  
+  # Remove digit characters
+  df_tokens$lemma <- gsub("[0-9]+" ,"", df_tokens$lemma)
+
+  # Remove NON-ASCII characters 
+  df_tokens$lemma <- str_replace_all(df_tokens$lemma, "[^[:alnum:]]", "")
+  
+  # Remove stopwords
+  df_tokens <- df_tokens %>% anti_join(stop_words, by = c("lemma" = "word"))
+  
+  # Remove words with length less than three letters
+  df_tokens$lemma <- gsub(" *\\b[[:alpha:]]{1,2}\\b *", "", df_tokens$lemma)
+  
+  # Select rows with words 
+  df_tokens <- subset(df_tokens, lemma != "")
+  
+  # Extract keywords (max bigrams) from dataframe using textrank (R package)
+  grams <- textrank_keywords(x = df_tokens$lemma, 
+                             ngram_max = 2, 
+                             sep = "-")
+  
+  # Merge the extracted keywords to the dataset
+  df_tokens$keyword <- txt_recode_ngram(df_tokens$lemma, 
+                                        compound = grams$keywords$keyword, 
+                                        ngram = grams$keywords$ngram, 
+                                        sep = "-")
+  
+  # Stack the columns lemma and keyword on top of each other
+  data <- melt(df_tokens, id.var = c("doc_id"), variable.name = "lemma_or_keyword")
+  
+  # Add a word frequency per doc_id
+  data <- data[, 
+               list(freq = .N), 
+               by = list(doc_id = doc_id, word = value)]
+  
+  # Remove empty rows 
+  data <- data[!is.na(data$word), ]
+  data <- as.data.table(data)
+
+  # Output the set of word_tokens (with doc_id and term frequency)
+  return(data)
+}
+
+# Apply function to abstract and keywords column of datasets
+emotion_keywords <- preprocessing(emotion_articles$DE)
+emotion_abstracts <- preprocessing(emotion_articles$AB)
+cooperation_keywords <- preprocessing(cooperation_articles$KEYWORDS)
+cooperation_abstracts <- preprocessing(cooperation_articles$ABSTRACT)
+
+# Save set of word-tokens
+saveRDS(emotion_keywords, "word_tokens/emotion_keywords.RData")
+saveRDS(emotion_abstracts, "word_tokens/emotion_abstracts.RData")
+saveRDS(cooperation_keywords, "word_tokens/cooperation_keywords.RData")
+saveRDS(cooperation_abstracts, "word_tokens/cooperation_abstracts.RData")
+
+# Number of unique words 
+print(length(unique(emotion_keywords$word)))      # -> 5441
+print(length(unique(emotion_abstracts$word)))     # -> 29019
+print(length(unique(cooperation_keywords$word)))  # -> 3412   
+print(length(unique(cooperation_abstracts$word))) # -> 9889
+
+# create csv files for fasttext training 
+write.csv(emotion_keywords, "word_tokens/emotion_keywords.csv")
+write.csv(emotion_abstracts, "word_tokens/emotion_abstracts.csv")
+write.csv(cooperation_keywords, "word_tokens/cooperation_keywords.csv")
+write.csv(cooperation_abstracts, "word_tokens/cooperation_abstracts.csv")
+```
+
+## FastText:
+
+```{r}
+# Load pre-trained token vectors trained using FastText (from https://fasttext.cc/docs/en/english-vectors.html)
+fasttext <- data.table::fread("cc.en.300.vec.gz", 
+                              data.table = F, 
+                              encoding = "UTF-8", 
+                              quote = "") 
+
+# Change column names 
+colnames(fasttext) <- c("word", paste("vec", 1:300, sep = ""))
+dim(fasttext) # -> [2000000 rows x 301 columns]
+head(fasttext)
+# -> The pre-trained FastText has 2 million tokens and 300 dimensions
+```
+```{r}
+# Function to create words-vectors matrix for words in the word_tokens dataset by extracting words from the fasttext pretrained model.
+ 
+embedding_matrix <- function(input){
+  # Select words that are in the input dataset
+  select <- subset(fasttext, word %in% input)
+
+  # Convert the word column to row index
+  embedding <- select %>% 
+    remove_rownames() %>% 
+    column_to_rownames(var = "word")
+
+  # Convert to matrix
+  matrix <- as.matrix(embedding)
+  
+  # Output = word-vectors matrix
+  return(matrix) 
+}
+
+# Check embedding matrix for different word_tokens datasets 
+ek_vectors <- embedding_matrix(emotion_keywords$word)
+ea_vectors <- embedding_matrix(emotion_abstracts$word)
+ck_vectors <- embedding_matrix(cooperation_keywords$word)
+ca_vectors <- embedding_matrix(cooperation_abstracts$word)
+
+# Retrieve dimension of matrix
+print(dim(ek_vectors)) # -> [3154  rows x 300 columns]
+print(dim(ea_vectors)) # -> [11624 rows x 300 columns]
+print(dim(ck_vectors)) # -> [2109 rows x 300 columns]
+print(dim(ca_vectors)) # -> [5117 rows x 300 columns]
+# -> Captures not all the words that are in the word_tokens datasets, but more effective than training a model 
+
+# Save embedding matrix
+saveRDS(ek_vectors, "vectors/ek_vectors.RData")
+saveRDS(ea_vectors, "vectors/ea_vectors.RData")
+saveRDS(ck_vectors, "vectors/ck_vectors.RData")
+saveRDS(ca_vectors, "vectors/ca_vectors.RData")
+```
+
+
+
+```{r}
+# Function that finds similar words to a given word (to check the created embedding matrix)
+
+csimilarity <- function(word, embedding, N) {
+  # Word = given word to find similar words 
+  # Embedding = the words and vectors matrix
+  # N = number of rows to return
+  similarities <- embedding[word, , drop = FALSE] %>%
+    sim2(embedding, y = ., method = "cosine")
+  
+  similarities[,1] %>% sort(decreasing = TRUE) %>% head(N)
+  # Output = set of similar words 
+}
+
+# Apply function on some words to check
+csimilarity("emotion", ek_vectors, 10)
+csimilarity("emotion regulation", ea_vectors, 10)
+csimilarity("cooperation", ck_vectors, 20)
+csimilarity("music", ca_vectors, 50)
+```
+
+```{r}
+# Interactive scatterplot with word distribution
+# Visualize data into two dimensions (to check word distribution)
+
+tsne <- function(embedding, number_of_words, perplexity) {
+  # Embedding = the words and vectors matrix
+  # Number_of_words = number of words to show on the plot
+  # Perplexity = perplexity parameter (should not be bigger than 3 * perplexity < nrow(X)
+  set.seed(0)
+  tsne <- Rtsne(embedding[2:number_of_words,], perplexity = perplexity, pca = TRUE)
+  
+  # Create dataframe 
+  tsne_df <- tsne$Y %>%
+    as.data.frame() %>%
+    mutate(word = row.names(embedding)[2:number_of_words]) 
+  
+  # Create figure 
+  fig <-  plot_ly(data = tsne_df,
+                  x = ~V1, 
+                  y = ~V2 , 
+                  text  = ~word, 
+                  type = "scatter", 
+                  mode = "text",
+                  textfont = list(color = "black", 
+                                  size = 6))
+  
+  # Add layout 
+  fig <- fig %>% layout(plot_bgcolor = "#e5ecf6")
+  
+  # Output =  two dimensions figure with the words
+  return(fig)
+}
+
+# Apply function on embedding matrix 
+tsne(ck_vectors, 1000, 100) 
+
+# -> Words in plot are overlapping, but zoom in to analyse further (results make sense)
+```
+
+## Hierarchical Clustering
+```{r}
+ek_vectors <- readRDS("vectors/ek_vectors.RData")
+ea_vectors <- readRDS("vectors/ea_vectors.RData")
+ck_vectors <- readRDS("vectors/ck_vectors.RData")
+ca_vectors <- readRDS("vectors/ca_vectors.RData")
+```
+
+```{r}
+# Find the optimal linkage method to use for hierarchical clustering (with cosine distance)
+
+find_linkage_method1 <- function(embedding_matrix){
+  
+  # Define linkage methods
+  linkage_methods <- c( "average", "single", "complete", "ward")
+  
+  # Function to compute agglomerative coefficient
+  ac <- function(x) {
+    # Calculate distance
+    dist <- proxy::dist(embedding_matrix, method = "cosine")
+    
+    # Compute agglomerative hierarchical clustering
+    agnes(dist, method = x)$ac
+  }
+
+  # Calculate agglomerative coefficient for each linkage method
+  sapply(linkage_methods, ac)
+}
+  
+# Apply function on the different embedding matrix
+find_linkage_method1(ek_vectors) # -> ward
+find_linkage_method1(ea_vectors) # -> ward (takes some time to run)
+find_linkage_method1(ck_vectors) # -> ward
+find_linkage_method1(ca_vectors) # -> ward
+
+# -> Ward’s minimum variance method produces the highest agglomerative coefficient for each dataset
+```
+
+
+```{r}
+# Find the optimal linkage method to use for hierarchical clustering (with euclidean distance)
+find_linkage_method2 <- function(embedding_matrix){
+  
+  # Define linkage methods
+  linkage_methods <- c( "average", "single", "complete", "ward")
+  
+  # Function to compute agglomerative coefficient
+  ac <- function(x) {
+    # Calculate distance 
+    dist <- dist(embedding_matrix, method = "euclidean")
+    
+    # Compute agglomerative hierarchical clustering
+    agnes(dist, method = x)$ac
+  }
+
+  # Calculate agglomerative coefficient for each linkage method
+  sapply(linkage_methods, ac)
+}
+  
+# Apply function on the different embedding matrix
+find_linkage_method2(ek_vectors) # -> ward
+find_linkage_method2(ea_vectors) # -> ward (takes some time to run)
+find_linkage_method2(ck_vectors) # -> ward
+find_linkage_method2(ca_vectors) # -> ward
+
+# -> Ward’s minimum variance method produces the highest agglomerative coefficient for each dataset
+```
+
+
+
+```{r}
+# Perform hierarchical clustering using Ward's minimum variance (with cosine distance)
+hclustering1 <- function(embedding_matrix){
+
+  # Compute the dissimilarity matrix 
+  dist <- proxy::dist(embedding_matrix, method = "cosine")
+  
+  # Perform hierarchical clustering using Ward's minimum variance
+  # Note that agnes(*, method="ward") corresponds to hclust(*, "ward.D2")
+  hclust <- hclust(d = dist, method = "ward.D2")
+  
+  # Plot dendrogram
+  plot(as.dendrogram(hclust))
+  
+  return(hclust)
+}
+
+# Apply function on the different embedding matrix
+hclustering1(ek_vectors)
+hclustering1(ea_vectors) # (takes some time to run)
+hclustering1(ck_vectors) 
+hclustering1(ca_vectors) 
+
+# -> The words are overlapping each other in the dendrogram, very difficult to determine number of clusters manually from plots
+```
+
+```{r}
+# Perform hierarchical clustering using Ward's minimum variance (with euclidean distance)
+hclustering2 <- function(embedding_matrix){
+
+  # Compute the dissimilarity matrix
+  dist <- dist(embedding_matrix, method = "euclidean")
+  
+  # Perform hierarchical clustering using Ward's minimum variance
+  # Note that agnes(*, method="ward") corresponds to hclust(*, "ward.D2")
+  hclust <- hclust(d = dist, method = "ward.D2")
+  
+  # Plot dendrogram
+  plot(as.dendrogram(hclust))
+  
+  return(hclust)
+}
+
+# Apply function on the different embedding matrix
+hclustering2(ek_vectors)
+hclustering2(ea_vectors) # (takes some time to run)
+hclustering2(ck_vectors) 
+hclustering2(ca_vectors) 
+
+# -> The words are overlapping each other in the dendrogram, very difficult to determine number of clusters manually from plots
+```
+
+```{r}
+# Detection of clusters in hierarchical clustering (cosine distance)
+hierarchical_clusters1 <- function(embedding_matrix){ 
+  # Compute the dissimilarity matrix using cosine 
+  dist <- proxy::dist(embedding_matrix, method = "cosine")
+  
+  # Perform hierarchical clustering using Ward's minimum variance
+  # Note that agnes(*, method="ward") corresponds to hclust(*, "ward.D2")
+  hc <- hclust(d = dist, method = "ward.D2")
+  
+  # Create dendrogram
+  dend <- as.dendrogram(hc)
+  
+  # Find clusters using dynamicTreeCut package
+  clusters <- cutreeDynamic(hc, distM = as.matrix(dist), method = "hybrid", deepSplit = 4)
+  
+  # Get the number of unique clusters
+  # Unassigned words are labeled 0 (ignore these)
+  clusters_numbers <- unique(clusters) - (0 %in% clusters)
+  n_clusters <- length(clusters_numbers)
+  print(n_clusters)
+
+  # Append cluster labels to original embedding matrix
+  dataset <- cbind(embedding_matrix, cluster = clusters)
+  
+  # Remove unassigned words
+  # No need, because hybrid handles the unassigned words resulting in no unassigned words 
+  dataset <- dataset[dataset[,301]!= 0,] 
+   
+  return(dataset)
+}
+
+# clusters_numbers:
+# -> ek: 97
+# -> ea: 320
+# -> ck: 63
+# -> ca: 153
+
+# apply function on the different embedding matrix
+hc_ek_cos <- hierarchical_clusters1(ek_vectors) 
+hc_ea_cos <- hierarchical_clusters1(ea_vectors)
+hc_ck_cos <- hierarchical_clusters1(ck_vectors) 
+hc_ca_cos <- hierarchical_clusters1(ca_vectors) 
+
+# retrieve dimension of matrix
+# must be 301, because of the cluster number column 
+print(dim(hc_ek_cos)) # -> [3154 rows x 301 columns]
+print(dim(hc_ea_cos)) # -> [11624 rows x 301 columns]
+print(dim(hc_ck_cos)) # -> [2109 rows x 301 columns]
+print(dim(hc_ca_cos)) # -> [5117 rows x 301 columns]
+# -> no unassigned words
+
+# save the embedding matrix with hierarchical clusters 
+saveRDS(hc_ek_cos, "hierarchical_clusters/hc_ek_cos.RData")
+saveRDS(hc_ea_cos, "hierarchical_clusters/hc_ea_cos.RData")
+saveRDS(hc_ck_cos, "hierarchical_clusters/hc_ck_cos.RData")
+saveRDS(hc_ca_cos, "hierarchical_clusters/hc_ca_cos.RData")
+```
+
+```{r}
+# Detection of clusters in hierarchical clustering (euclidean distance)
+hierarchical_clusters2 <- function(embedding_matrix){ 
+  # Compute the dissimilarity matrix using euclidean 
+  dist <- dist(embedding_matrix, method = "euclidean")
+  
+  # Perform hierarchical clustering using Ward's minimum variance
+  # Note that agnes(*, method="ward") corresponds to hclust(*, "ward.D2")
+  hc <- hclust(d = dist, method = "ward.D2")
+  
+  # Create dendrogram
+  dend <- as.dendrogram(hc)
+  
+  # Find clusters using dynamicTreeCut package
+  clusters <- cutreeDynamic(hc, distM = as.matrix(dist), method = "hybrid", deepSplit = 4)
+  
+  # Get the number of unique clusters
+  # Unassigned objects are labeled 0 (ignore these)
+  clusters_numbers <- unique(clusters) - (0 %in% clusters)
+  n_clusters <- length(clusters_numbers)
+  print(n_clusters)
+
+  # Append cluster labels to original embedding matrix
+  dataset <- cbind(embedding_matrix, cluster = clusters)
+  
+  # Remove unassigned words
+  dataset <- dataset[dataset[,301]!= 0,]
+
+  return(dataset)
+}
+
+# Clusters_numbers:
+# -> ek: 74
+# -> ea: 138
+# -> ck: 59
+# -> ca: 122
+
+# Apply function on the different embedding matrix
+hc_ek_euc <- hierarchical_clusters2(ek_vectors) 
+hc_ea_euc <- hierarchical_clusters2(ea_vectors)
+hc_ck_euc <- hierarchical_clusters2(ck_vectors) 
+hc_ca_euc <- hierarchical_clusters2(ca_vectors) 
+
+# Retrieve dimension of matrix
+# Must be 301, because of the cluster number column 
+print(dim(hc_ek_euc)) # -> [3154 rows x 301 columns]
+print(dim(hc_ea_euc)) # -> [11624 rows x 301 columns]
+print(dim(hc_ck_euc)) # -> [2109 rows x 301 columns]
+print(dim(hc_ca_euc)) # -> [5117 rows x 301 columns]
+# -> No unassigned words
+
+# Save the embedding matrix with hierarchical clusters 
+saveRDS(hc_ek_euc, "hierarchical_clusters/hc_ek_euc.RData")
+saveRDS(hc_ea_euc, "hierarchical_clusters/hc_ea_euc.RData")
+saveRDS(hc_ck_euc, "hierarchical_clusters/hc_ck_euc.RData")
+saveRDS(hc_ca_euc, "hierarchical_clusters/hc_ca_euc.RData")
+```
+
+## Spherical k-Means Clustering
+```{r}
+ek_vectors <- readRDS("vectors/ek_vectors.RData")
+ea_vectors <- readRDS("vectors/ea_vectors.RData")
+ck_vectors <- readRDS("vectors/ck_vectors.RData")
+ca_vectors <- readRDS("vectors/ca_vectors.RData")
+```
+
+### Determine the number of clusters (Average Silhouette Width)
+```{r}
+nclusters_asw <- function(embedding_matrix, filename){
+  
+  # Define the number of cluster (k = 10, 20, 30...300)
+  ks <- seq(10, 300, by = 10)
+
+  # Compute the dissimilarity matrix using cosine
+  dist <- proxy::dist(embedding_matrix, method = "cosine")
+  
+  # Calculate average silhouette width for different number of clusters
+  avg_silwidth <- sapply(ks, FUN = function(k) {
+    fpc::cluster.stats(dist, 
+                       skmeans(embedding_matrix, 
+                               method = "genetic", 
+                               k = k, 
+                               m = 1, 
+                               weights = 1)$cluster)$avg.silwidth})
+  # Open svg file
+  svg(filename)
+  
+  # Create plo k versus average silhouette widtht
+  data.frame(k = ks, width = avg_silwidth) %>%
+    ggplot(aes(x = k, y = width)) +
+    geom_line() + 
+    geom_point() +
+    scale_y_continuous(name = "Average silhouette width")
+
+  # Close svg file
+  dev.off()
+
+  # Get the best number of cluster 
+  best_k <- ks[which.max(avg_silwidth)]
+  return(best_k) 
+}
+
+# Apply function on the different embedding matrix and save the number of clusters
+nclusters_ck1 <- nclusters_asw(ck_vectors, "skmean_clusters/avg_width_ck.svg") 
+nclusters_ca1 <- nclusters_asw(ca_vectors, "skmean_clusters/avg_width_ca.svg")
+nclusters_ek1 <- nclusters_asw(ek_vectors, "skmean_clusters/avg_width_ek.svg")
+nclusters_ea1 <- nclusters_asw(ea_vectors, "skmean_clusters/avg_width_ea.svg")
+
+# Show the optimal number of clusters for each word embedding
+print(nclusters_ck1) # -> 160
+print(nclusters_ca1) # -> 300
+print(nclusters_ek1) # -> 230
+print(nclusters_ea1) # -> 240
+
+# Runtime taken:
+# -> ck: 1.277181 hours
+# -> ca: 2.399865 hours
+# -> ek: 1.731675 hours
+# -> ea: 4.739274 hours 
+```
+
+### Determine the number of clusters (Dunn Index)
+```{r}
+start.time <- Sys.time()
+
+nclusters_dunn <- function(embedding_matrix, filename){
+  # Define the number of cluster (k = 10, 20, 30...300)
+  ks <- seq(10, 300, by = 10)
+  
+  # Compute the dissimilarity matrix using cosine
+  dist <- proxy::dist(embedding_matrix, method = "cosine")
+  
+  dunn_index <- sapply(ks, FUN = function(k) {
+    fpc::cluster.stats(dist, 
+                       skmeans(embedding_matrix, 
+                               method = "genetic", 
+                               k = k, 
+                               m = 1, 
+                               weights = 1)$cluster)$dunn})
+  # Open svg file
+  svg(filename)
+  
+  # Create plot k versus dunn index
+  data.frame(k = ks, width = dunn_index) %>%
+    ggplot(aes(x = k, y = width)) +
+    geom_line() + 
+    geom_point() +
+    scale_y_continuous(name = "Dunn Index")
+
+  # Close svg file
+  dev.off()
+  
+  # Get the best number of cluster 
+  best_k <- ks[which.max(dunn_index)]
+  return(best_k)
+}
+
+# Apply function on the different embedding matrix and save the number of clusters
+nclusters_ck2 <- nclusters_dunn(ck_vectors, "skmean_clusters/dunn_index_ck.svg") 
+nclusters_ca2 <- nclusters_dunn(ca_vectors, "skmean_clusters/dunn_index_ca.svg")
+nclusters_ek2 <- nclusters_dunn(ek_vectors, "skmean_clusters/dunn_index_ek.svg")
+nclusters_ea2 <- nclusters_dunn(ea_vectors, "skmean_clusters/dunn_index_ea.svg")
+
+# Show the optimal number of clusters for each word embedding
+print(nclusters_ck2)  # -> 100
+print(nclusters_ca2)  # -> 260
+print(nclusters_ek2)  # -> 300
+print(nclusters_ea2)  # -> 230
+
+# Runtime taken:
+# -> ck: 2.077181 hours
+# -> ca: 3.399865 hours
+# -> ek: 2.731675 hours
+# -> ea: 6.492199 hours
+```
+
+
+### Apply cluster labels (Spherical k-Means Clustering)
+```{r}
+# Add cluster labels based on the result of Average Silhouette Width
+skmclustering1 <- function(nclust, embedding_matrix){
+  
+  # Perform spherical K-means clustering
+  skm <- skmeans(embedding_matrix, 
+                 method = "genetic",
+                 k = nclust, 
+                 m = 1, 
+                 weights = 1)
+  
+  # Append cluster labels to original embedding matrix
+  dataset <- cbind(embedding_matrix, cluster = skm$cluster)
+  return(dataset)
+}
+
+# Apply function to add column with cluster number to matrix
+#skm_ck1 <- skmclustering1(nclusters_ck1, ck_vectors)
+#skm_ca1 <- skmclustering1(nclusters_ca1, ca_vectors)
+#skm_ek1 <- skmclustering1(nclusters_ek1, ek_vectors) 
+#skm_ea1 <- skmclustering1(nclusters_ea1, ea_vectors)
+
+skm_ck1 <- skmclustering1(160, ck_vectors)
+skm_ca1 <- skmclustering1(300, ca_vectors)
+skm_ek1 <- skmclustering1(230, ek_vectors) 
+skm_ea1 <- skmclustering1(240, ea_vectors)
+
+# Retrieve dimension of matrix
+# Must be 301, because of the cluster number column 
+print(dim(skm_ck1)) # -> [2109 rows x 301 columns] 
+print(dim(skm_ca1)) # -> [5117 rows x 301 columns] 
+print(dim(skm_ek1)) # -> [3154 rows x 301 columns] 
+print(dim(skm_ea1)) # -> [11624 rows x 301 columns] 
+
+# Check number of unique clusters 
+print(length(unique(skm_ck1[,301]))) # -> 160
+print(length(unique(skm_ca1[,301]))) # -> 300
+print(length(unique(skm_ek1[,301]))) # -> 230
+print(length(unique(skm_ea1[,301]))) # -> 240
+
+# Save the embedding matrix with spherical K-means clusters 
+saveRDS(skm_ck1, "skmean_clusters/skm_ck1.RData")
+saveRDS(skm_ca1, "skmean_clusters/skm_ca1.RData")
+saveRDS(skm_ek1, "skmean_clusters/skm_ek1.RData")
+saveRDS(skm_ea1, "skmean_clusters/skm_ea1.RData")
+```
+
+```{r}
+# Add cluster labels based on the result of Dunn Index
+skmclustering2 <- function(nclust, embedding_matrix){
+  
+  # Perform spherical K-means clustering
+  skm <- skmeans(embedding_matrix, 
+                 method = "genetic",
+                 k = nclust, 
+                 m = 1, 
+                 weights = 1)
+  
+  # Append cluster labels to original embedding matrix
+  dataset <- cbind(embedding_matrix, cluster = skm$cluster)
+  return(dataset)
+}
+
+# Apply function to add column with cluster number to matrix
+#skm_ck2 <- skmclustering2(nclusters_ck2, ck_vectors)
+#skm_ca2 <- skmclustering2(nclusters_ca2, ca_vectors)
+#skm_ek2 <- skmclustering2(nclusters_ek2, ek_vectors) 
+#skm_ea2 <- skmclustering2(nclusters_ea2, ea_vectors)
+
+skm_ck2 <- skmclustering2(100, ck_vectors)
+skm_ca2 <- skmclustering2(260, ca_vectors)
+skm_ek2 <- skmclustering2(300, ek_vectors) 
+skm_ea2 <- skmclustering2(230, ea_vectors)
+
+# Retrieve dimension of matrix
+# Must be 301, because of the cluster number column 
+print(dim(skm_ck2)) # -> [2109 rows x 301 columns] 
+print(dim(skm_ca2)) # -> [5117 rows x 301 columns] 
+print(dim(skm_ek2)) # -> [3154 rows x 301 columns] 
+print(dim(skm_ea2)) # -> [11624 rows x 301 columns] 
+
+# Check number of unique clusters 
+print(length(unique(skm_ck2[,301]))) # -> 100
+print(length(unique(skm_ca2[,301]))) # -> 260
+print(length(unique(skm_ek2[,301]))) # -> 300
+print(length(unique(skm_ea2[,301]))) # -> 230
+
+# Save the embedding matrix with spherical K-means clusters 
+saveRDS(skm_ck2, "skmean_clusters/skm_ck2.RData")
+saveRDS(skm_ca2, "skmean_clusters/skm_ca2.RData") 
+saveRDS(skm_ek2, "skmean_clusters/skm_ek2.RData")
+saveRDS(skm_ea2, "skmean_clusters/skm_ea2.RData")
+```
+
+
+## Clustering validation
+```{r}
+# silhouette information (Spherical K-means clustering)
+silhouette <- function(word_vector, nclust){
+  
+  # Compute the dissimilarity matrix using cosine 
+  dist <- proxy::dist(word_vector, method = "cosine")
+  
+  # perform spherical k-means clustering
+  skm <- skmeans(word_vector, 
+                 method = "genetic",
+                 k = nclust, 
+                 m = 1, 
+                 weights = 1)
+  
+  # compute silhouette information
+  sil <- cluster::silhouette(skm$cluster, dist)
+  
+  # summary of the silhouette information
+  sum_sil <- summary(sil)
+  
+  # get size of each cluster
+  clus_sizes <- sum_sil$clus.sizes
+  #print(clus_sizes)
+  
+  # silhouette information of each cluster
+  clus_avg_widths <- sum_sil$clus.avg.widths
+  # print(clus_avg_widths[clus_avg_widths < 0])
+  barplot(clus_avg_widths, xlab = "Cluster", ylab = "Average Silhouette Width")
+}
+
+# Average Silhouette Width
+silhouette(ck_vectors, nclusters_ck1) 
+silhouette(ca_vectors, nclusters_ca1)
+silhouette(ek_vectors, nclusters_ek1)
+silhouette(ea_vectors, nclusters_ea1)
+
+# Dunn Index
+silhouette(ck_vectors, nclusters_ck2)
+silhouette(ca_vectors, nclusters_ca2)
+silhouette(ek_vectors, nclusters_ek2)
+silhouette(ea_vectors, nclusters_ea2)
+```
+
+
+```{r}
+# silhouette information (hierarchical clustering using cosine distance)
+silhouette <- function(word_vector){
+  
+  # Compute the dissimilarity matrix using cosine 
+  dist <- proxy::dist(word_vector, method = "cosine")
+  
+  # perform hierarchical clustering
+  hc <- hclust(d = dist, method = "ward.D2")
+  
+  # Find clusters using dynamicTreeCut package
+  clusters <- cutreeDynamic(hc, distM = as.matrix(dist), method = "hybrid", deepSplit = 4)
+  
+  # compute silhouette information
+  sil <- cluster::silhouette(clusters, dist)
+  
+  # summary of the silhouette information
+  sum_sil <- summary(sil)
+  
+  # get size of each cluster
+  clus_sizes <- sum_sil$clus.sizes
+  #print(clus_sizes)
+  
+  # silhouette information of each cluster
+  clus_avg_widths <- sum_sil$clus.avg.widths
+  #print(clus_avg_widths[clus_avg_widths < 0])
+  barplot(clus_avg_widths, xlab = "Cluster", ylab = "Average Silhouette Width")
+}
+
+silhouette(ck_vectors)
+silhouette(ca_vectors)
+silhouette(ek_vectors)
+silhouette(ea_vectors)
+```
+
+```{r}
+# silhouette information (hierarchical clustering using euclidean distance)
+silhouette <- function(word_vector){
+  
+  # Compute the dissimilarity matrix using euclidean 
+  dist <- dist(word_vector, method = "euclidean")
+  
+  # perform hierarchical clustering
+  hc <- hclust(d = dist, method = "ward.D2")
+  
+  # Find clusters using dynamicTreeCut package
+  clusters <- cutreeDynamic(hc, distM = as.matrix(dist), method = "hybrid", deepSplit = 4)
+  
+  # compute silhouette information
+  sil <- cluster::silhouette(clusters, dist)
+  
+  # summary of the silhouette information
+  sum_sil <- summary(sil)
+  
+  # get size of each cluster
+  clus_sizes <- sum_sil$clus.sizes
+  #print(clus_sizes)
+  
+  # silhouette information of each cluster
+  clus_avg_widths <- sum_sil$clus.avg.widths
+  #print(clus_avg_widths[clus_avg_widths < 0])
+  barplot(clus_avg_widths, xlab = "Cluster", ylab = "Average Silhouette Width")
+}
+
+silhouette(ck_vectors)
+silhouette(ca_vectors)
+silhouette(ek_vectors)
+silhouette(ea_vectors)
+```
+
+
+## Make data ready for interactive network
+```{r}
+emotion_keywords <- readRDS("word_tokens/emotion_keywords.RData")
+skm_ek1 <- readRDS("skmean_clusters/skm_ek1.RData")
+```
+
+```{r}
+# merge word-tokens with clustered data to have a data table that contains the words, doc-id, freq, vectors and cluster number and add labels 
+
+data_tables <- function(word_tokens, clustered_data){
+  # convert clustered_data to matrix
+  df <- as.data.frame(clustered_data)
+  # convert word column to row
+  df <- tibble::rownames_to_column(df, "word")
+  # merge data tables
+  merged_df <- merge(word_tokens, df, by = "word")
+  
+  # the word that occurs most in the cluster is used to label the cluster with a name (only for the network)
+  data_count <- merged_df %>% 
+    group_by(word, cluster) %>%
+    summarise(count = sum(freq))
+
+  # get the number of clusters
+  nclusters <- unique(data_count$cluster)
+  
+  # add labels
+  labels <- c()
+  cluster <- c()
+  for(x in nclusters){
+    cluster[x] <- x
+    # for each cluster get the word that occurs the most in the cluster
+   data <- data_count[data_count$cluster == x,]
+    label <- data$word[which.max(data$count)]
+    labels[x] <- label
+  }
+  # add the labels to the data table 
+  df <- data.frame(cluster, labels)
+  main_df <- merge(merged_df, df, by = "cluster")
+  return(main_df) 
+}
+
+# apply function
+example <- data_tables(emotion_keywords, skm_ek1)
+example
+```
+
+```{r}
+# proof-of-concept: top 20 most common phenomena (clusters)
+co_occurence <- function(data_tables){
+  select_columns <- select(data_tables, doc_id, word, freq, cluster, labels)
+
+# get unique phenomena in each doc_id
+  data_count <- select_columns %>%                             
+    group_by(doc_id, cluster) %>%
+    summarise(count = n_distinct(cluster))
+  
+  # count how often phenomena is present
+  data_count2 <- select_columns %>%                             
+    group_by(cluster) %>%
+    summarise(count = length(cluster))
+  
+  # sort the values 
+  sort <- data_count2[order(-data_count2$count),]
+  
+  # get 20 most common phenomena 
+  most_common_20 <- head(sort$cluster, 20)
+  
+  # get only most common phenomena information
+  select_columns_most_common <- select_columns[select_columns$cluster %in% most_common_20,]
+
+  # select relevant columns
+  select_columns <- select(select_columns_most_common, doc_id, labels, freq)
+  
+  # pairwise correlation 
+  word_cor <- select_columns %>%
+   group_by(labels) %>%
+   pairwise_cor(labels, doc_id) %>%
+    # get positive correlations
+   filter(!is.na(correlation),
+         correlation > 0)
+
+  return(word_cor)
+}
+co_occurence <- co_occurence(example)
+```
+
+
+```{r}
+
+x <- example[example$cluster == 10,]
+v <- select(x, cluster, word, freq, labels)
+
+data_count <- v %>% 
+    group_by(labels, word) %>%
+    summarise(count = sum(freq))
+data_count <-  data_count[order(-data_count$count),]
+
+data_count
+```
+
+```{r}
+data_count <- example %>% 
+    group_by( labels, word) %>%
+    summarise(count = sum(freq))
+
+
+data_count
+```
+
+```{r}
+
+example2 <- select(example, cluster, word, freq, labels)
+
+example2 <- example2 %>% 
+    group_by(labels, word) %>%
+    summarise(count = sum(freq))
+example2 <-  example2[order(-example2$count),]
+example2[example2$labels == "emotion",]
+```
+
+
+```{r}
+library(visNetwork)
+library(igraph)
+set.seed(2017)
+
+network <- function(co_occurence){
+  # set nodes 
+  nodes <- unique(c(co_occurence$item1, co_occurence$item2))
+  nodes <- data.frame(id = nodes, label = nodes, stringsAsFactors = FALSE)
+  
+  # set edge 
+  edges <- co_occurence
+  colnames(edges) <- c("from", "to", "width")
+  edges <- select(edges, from, to, width)
+  edges$width <- scales::rescale(sqrt(edges$width), to = c(0, 6))
+
+  # create network
+  wordnetwork <- graph_from_data_frame(co_occurence, directed = FALSE)
+
+  visNetwork(nodes, edges, width = "100%") %>% 
+    visIgraphLayout(layout = "layout_with_fr") %>% 
+    visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>% 
+    visEdges(aes(width = width, edge_alpha = width), color = list(highlight = "blue", hover = "blue")) %>%
+    visNodes(size = 15) %>%
+    visSave(file = "example_network.html")
+}
+network(co_occurence)
+```
+
+```{r}
+library(shiny)
+
+
+server <- function(input, output) {
+  output$mynetworkid <- renderVisNetwork({
+nodes <- unique(c(co_occurence$item1, co_occurence$item2))
+  nodes <- data.frame(id = nodes, label = nodes, stringsAsFactors = FALSE)
+  
+  # set edge 
+  edges <- co_occurence
+  colnames(edges) <- c("from", "to", "width")
+  edges <- select(edges, from, to, width)
+  edges$width <- scales::rescale(sqrt(edges$width), to = c(0, 6))
+
+  # create network
+  wordnetwork <- graph_from_data_frame(co_occurence, directed = FALSE)
+
+  visNetwork(nodes, edges, width = "100%") %>% 
+    visIgraphLayout(layout = "layout_with_fr") %>% 
+    visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>% 
+    visEdges(aes(width = width, edge_alpha = width), color = list(highlight = "blue", hover = "blue")) %>%
+    visNodes(size = 15) %>%
+  visEvents(select = "function(nodes) {
+                Shiny.onInputChange('current_node_selection', nodes.nodes);
+                ;}")
+  })
+  
+
+    output$table <- renderTable(example2[example2$labels == current_node_selection,]  %>% 
+    edge %>% 
+      filter((to %in% input$current_node_selection)|(from %in% input$current_node_selection)),
+    options = list(lengthChange = FALSE)
+  )
+  
+  
+}
+
+ui <- fluidPage(
+    visNetworkOutput("mynetworkid")
+)
+
+shinyApp(ui = ui, server = server)
+
+
+```
+
+```{r}
+library(shiny)
+
+
+server <- function(input, output) {
+  output$table <- renderTable(example2)
+  
+}
+
+shinyApp(ui = ui, server = server)
+```
